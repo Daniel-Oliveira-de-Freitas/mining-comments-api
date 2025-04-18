@@ -1,49 +1,63 @@
 from flask import Flask, request, jsonify
-from goose3 import Goose
+import requests
+from bs4 import BeautifulSoup
 import json
-import os
+from datetime import datetime
+import hashlib
 
 app = Flask(__name__)
 
-@app.route('/')
-def hello():
-    return 'Hello World of the Comments!'
+def scrape_comments_from_page(url):
+    try:
+        response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        response.raise_for_status()
+    except Exception as e:
+        return {"error": f"Erro ao acessar a página: {str(e)}"}
 
-@app.route('/fakeNewsDetection/comments', methods=['POST'])
-def filter_comments():
-    req_data = request.get_json()
+    soup = BeautifulSoup(response.text, 'html.parser')
 
-    if not req_data:
-        return jsonify({"error": "JSON inválido ou não enviado."}), 400
+    # DEBUG: salvar HTML num arquivo local para inspecionar
+    with open('pagina_raspada.html', 'w', encoding='utf-8') as f:
+        f.write(soup.prettify())
 
-    urls = req_data.get("urls", [])
-    keyword = req_data.get("keyword", "").lower()
-    result = []
+    comments = []
 
-    for url in urls:
-        try:
-            g = Goose()
-            article = g.extract(url=url)
-            text = article.cleaned_text or ""
+    # Tenta pegar todos os <p> visíveis que não estejam vazios
+    for el in soup.find_all('p'):
+        text = el.get_text(strip=True)
+        if text and len(text) > 20:  # ignora textos muito curtos
+            comment_obj = {
+                "body": text,
+                "author": "Desconhecido",
+                "createDate": datetime.utcnow().isoformat(),
+                "sentiment": None,
+                "search": None
+            }
+            comments.append(comment_obj)
 
-            comentarios = text.split('\n')
-            comentarios_filtrados = [c for c in comentarios if keyword in c.lower()]
+    return comments
 
-            if comentarios_filtrados:
-                result.append({
-                    "url": url,
-                    "comentarios_filtrados": comentarios_filtrados
-                })
 
-        except Exception as e:
-            result.append({
-                "url": url,
-                "erro": str(e)
-            })
 
-    # Salva resultado em JSON local (opcional)
-    output_path = os.path.join(os.getcwd(), 'comentarios_filtrados.json')
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(result, f, ensure_ascii=False, indent=4)
+@app.route('/comments/scraping', methods=['POST'])
+def scraping_comments():
+    data = request.get_json()
+    url = data.get('url')
 
-    return jsonify(result)
+    comments = scrape_comments_from_page(url)
+
+    if isinstance(comments, dict) and "error" in comments:
+        return jsonify(comments), 400
+
+    with open('scraped_comments.json', 'w', encoding='utf-8') as f:
+        json.dump(comments, f, ensure_ascii=False, indent=4)
+
+    return jsonify({
+        "status": "success",
+        "message": f"{len(comments)} comentários coletados com scraping",
+        "comments": comments
+    })
+
+
+if __name__ == '__main__':
+    app.run(port=5000)
