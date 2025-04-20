@@ -14,7 +14,7 @@ CORS(app, origins='*')
 def hello():
     return 'Hello Comments World!'
 
-def scrape_comments_from_page(url, keyword):
+def scrape_comments_from_page(url, keyword, search):
     try:
         response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
         response.raise_for_status()
@@ -33,12 +33,12 @@ def scrape_comments_from_page(url, keyword):
                 "author": "Desconhecido",
                 "createDate": datetime.utcnow().isoformat(),
                 "sentiment": None,
-                "search": None
+                "search": search
             })
 
     return comments
 
-def crawl_comments_from_url(start_url, keyword, max_pages=5):
+def crawl_comments_from_url(start_url, keyword, search, max_pages=5):
     visited = set()
     queue = deque([start_url])
     comments = []
@@ -69,7 +69,7 @@ def crawl_comments_from_url(start_url, keyword, max_pages=5):
                     "author": "Desconhecido",
                     "createDate": datetime.utcnow().isoformat(),
                     "sentiment": None,
-                    "search": None
+                    "search": search
                 })
 
         base_url = '{uri.scheme}://{uri.netloc}'.format(uri=urlparse(start_url))
@@ -87,6 +87,7 @@ def scraping_comments():
     data = request.get_json()
     urls = data.get('urls')
     keyword = data.get('keyword')
+    search = data.get('search')
 
     if not urls or not isinstance(urls, list) or not keyword:
         return jsonify({"error": "urls (lista) e keyword são obrigatórios"}), 400
@@ -94,7 +95,7 @@ def scraping_comments():
     all_comments = []
 
     for url in urls:
-        comments = scrape_comments_from_page(url, keyword)
+        comments = scrape_comments_from_page(url, keyword, search)
         if isinstance(comments, dict) and "error" in comments:
             continue
         all_comments.extend(comments)
@@ -110,6 +111,7 @@ def crawling_comments():
     data = request.get_json()
     urls = data.get('urls')
     keyword = data.get('keyword')
+    search = data.get('search')
 
     if not urls or not isinstance(urls, list) or not keyword:
         return jsonify({"error": "urls (lista) e keyword são obrigatórios"}), 400
@@ -117,7 +119,7 @@ def crawling_comments():
     all_comments = []
 
     for url in urls:
-        comments = crawl_comments_from_url(url, keyword)
+        comments = crawl_comments_from_url(url, keyword, search)
         all_comments.extend(comments)
 
     return jsonify({
@@ -126,7 +128,7 @@ def crawling_comments():
         "comments": all_comments
     })
 
-# # Permite rodar localmente com `python index.py`
+# Permite rodar localmente com `python index.py`
 # if __name__ == "__main__":
 #     port = int(os.environ.get("PORT", 5000))
 #     app.run(host="0.0.0.0", port=port)
