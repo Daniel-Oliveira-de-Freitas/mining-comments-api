@@ -4,16 +4,17 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 from collections import deque
-import json
+from flask_cors import CORS
+import os
 
 app = Flask(__name__)
+CORS(app, origins='*')
 
 @app.route('/')
 def hello():
     return 'Hello Comments World!'
 
-# Raspagem simples da URL fornecida
-def scrape_comments_from_page(url):
+def scrape_comments_from_page(url, keyword):
     try:
         response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
         response.raise_for_status()
@@ -21,25 +22,23 @@ def scrape_comments_from_page(url):
         return {"error": f"Erro ao acessar a página: {str(e)}"}
 
     soup = BeautifulSoup(response.text, 'html.parser')
-
     comments = []
 
     for el in soup.find_all('p'):
         text = el.get_text(strip=True)
         if text and len(text) > 20:
-            comment_obj = {
+            comments.append({
+                "keyword": keyword,
                 "body": text,
                 "author": "Desconhecido",
                 "createDate": datetime.utcnow().isoformat(),
                 "sentiment": None,
                 "search": None
-            }
-            comments.append(comment_obj)
+            })
 
     return comments
 
-# Crawler que segue links internos
-def crawl_comments_from_url(start_url, max_pages=5):
+def crawl_comments_from_url(start_url, keyword, max_pages=5):
     visited = set()
     queue = deque([start_url])
     comments = []
@@ -65,6 +64,7 @@ def crawl_comments_from_url(start_url, max_pages=5):
             text = p.get_text(strip=True)
             if text and len(text) > 20:
                 comments.append({
+                    "keyword": keyword,
                     "body": text,
                     "author": "Desconhecido",
                     "createDate": datetime.utcnow().isoformat(),
@@ -72,7 +72,6 @@ def crawl_comments_from_url(start_url, max_pages=5):
                     "search": None
                 })
 
-        # Segue links internos
         base_url = '{uri.scheme}://{uri.netloc}'.format(uri=urlparse(start_url))
         for link_tag in soup.find_all('a', href=True):
             href = link_tag['href']
@@ -83,36 +82,51 @@ def crawl_comments_from_url(start_url, max_pages=5):
 
     return comments
 
-# Endpoint: /comments/scraping
 @app.route('/comments/scraping', methods=['POST'])
 def scraping_comments():
     data = request.get_json()
-    url = data.get('url')
+    urls = data.get('urls')
+    keyword = data.get('keyword')
 
-    comments = scrape_comments_from_page(url)
+    if not urls or not isinstance(urls, list) or not keyword:
+        return jsonify({"error": "urls (lista) e keyword são obrigatórios"}), 400
 
-    if isinstance(comments, dict) and "error" in comments:
-        return jsonify(comments), 400
+    all_comments = []
+
+    for url in urls:
+        comments = scrape_comments_from_page(url, keyword)
+        if isinstance(comments, dict) and "error" in comments:
+            continue
+        all_comments.extend(comments)
 
     return jsonify({
         "status": "success",
-        "message": f"{len(comments)} comentários coletados com scraping",
-        "comments": comments
+        "message": f"{len(all_comments)} comentários coletados com scraping",
+        "comments": all_comments
     })
 
-# Endpoint: /comments/crawling
 @app.route('/comments/crawling', methods=['POST'])
 def crawling_comments():
     data = request.get_json()
-    url = data.get('url')
+    urls = data.get('urls')
+    keyword = data.get('keyword')
 
-    if not url:
-        return jsonify({"error": "URL é obrigatória"}), 400
+    if not urls or not isinstance(urls, list) or not keyword:
+        return jsonify({"error": "urls (lista) e keyword são obrigatórios"}), 400
 
-    comments = crawl_comments_from_url(url)
+    all_comments = []
+
+    for url in urls:
+        comments = crawl_comments_from_url(url, keyword)
+        all_comments.extend(comments)
 
     return jsonify({
         "status": "success",
-        "message": f"{len(comments)} comentários coletados com crawling",
-        "comments": comments
+        "message": f"{len(all_comments)} comentários coletados com crawling",
+        "comments": all_comments
     })
+
+# # Permite rodar localmente com `python index.py`
+# if __name__ == "__main__":
+#     port = int(os.environ.get("PORT", 5000))
+#     app.run(host="0.0.0.0", port=port)
