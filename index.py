@@ -1,134 +1,182 @@
-from flask import Flask, request, jsonify
-import requests
-from bs4 import BeautifulSoup
-from datetime import datetime
-from urllib.parse import urljoin, urlparse
-from collections import deque
-from flask_cors import CORS
 import os
+import time
+import requests
+from flask import Flask, request, jsonify
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 
 app = Flask(__name__)
-CORS(app, origins='*')
+
+# Coloque sua chave da API Groq aqui (ou defina via variável de ambiente)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
+
+
+def scroll_to_bottom(driver):
+    last_height = driver.execute_script("return document.body.scrollHeight")
+    while True:
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2)
+        new_height = driver.execute_script("return document.body.scrollHeight")
+        if new_height == last_height:
+            break
+        last_height = new_height
+
+
+def scrape_full_html_from_page(url):
+    options = Options()
+    options.add_argument("--headless=chrome")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--window-size=1920,1080")
+
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+
+    try:
+        driver.get(url)
+
+        # Tentar clicar na aba de avaliações se existir
+        # temos que mudar essa parte depois pra entender o que ele ta fazendo
+        try:
+            aba_avaliacoes = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, "//a[contains(@href, '#reviews')]"))
+            )
+            aba_avaliacoes.click()
+            time.sleep(3)
+        except Exception:
+            print("Aba de avaliações não encontrada ou não clicável. Continuando...")
+
+        # Rola até o fim da página para carregar todo o conteúdo dinâmico
+        scroll_to_bottom(driver)
+
+        # Pega o HTML completo da página
+        full_html = driver.page_source
+        print(full_html)
+        return full_html
+
+    except Exception as e:
+        print(f"Erro ao acessar a URL ou extrair o HTML: {e}")
+        return None
+    finally:
+        driver.quit()
+
+
+def send_comments_to_llm(html_snippet, keyword):
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    html_snippet = """
+    <!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>Comentário de Exemplo</title>
+    <style>
+        .ui-reviewcomment {
+            border: 1px solid #ccc;
+            padding: 10px;
+            margin: 10px;
+            font-family: Arial, sans-serif;
+            background-color: #f9f9f9;
+        }
+        .ui-reviewauthor {
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        .ui-reviewdate {
+            font-size: 0.9em;
+            color: #666;
+            margin-bottom: 5px;
+        }
+        .ui-reviewcontent {
+            font-size: 1em;
+        }
+    </style>
+</head>
+<body>
+
+<div class="ui-reviewcomment">
+    <div class="ui-reviewauthor">João Silva</div>
+    <div class="ui-reviewdate">27 de Maio de 2025</div>
+    <div class="ui-reviewcontent">
+        Ótimo produto! Chegou rápido e a qualidade superou minhas expectativas.
+    </div>
+</div>
+
+</body>
+</html>
+    """
+
+    prompt = f"""
+Você receberá blocos HTML contendo comentários de usuários.
+Extraia os dados abaixo para cada comentário encontrado:
+
+- "keyword": sempre retorne "{keyword}"
+- "body": o texto do comentário
+- "author": o nome do autor do comentário (se disponível)
+- "createDate": data atual em formato ISO 8601
+- "sentiment": null
+- "search": null
+
+Retorne uma lista de objetos JSON com esse formato exato para cada comentário.
+
+HTML dos comentários:
+{html_snippet}
+    """
+
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 1
+    }
+
+    response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+
+    if response.status_code == 200:
+        return response.json()["choices"][0]["message"]["content"]
+    else:
+        print("Erro ao chamar a API Groq:", response.status_code, response.text)
+        return None
+
+
+@app.route('/analisar-comentarios', methods=['POST'])
+def analisar_comentarios():
+    data = request.get_json()
+    urls = data.get("urls")  # Lista de URLs
+    keyword = data.get("keyword")
+
+    if not urls or not keyword:
+        return jsonify({"error": "Parâmetros 'urls' (lista) e 'keyword' são obrigatórios."}), 400
+
+    resultados = []
+
+    for url in urls:
+        html = scrape_full_html_from_page(url)
+        if not html:
+            resultados.append({"error": "Falha ao extrair comentários", "url": url})
+            continue
+
+        resultado = send_comments_to_llm(html, keyword)
+        if resultado:
+            resultados.append({"url": url, "resultado": resultado})
+        else:
+            resultados.append({"error": "Erro ao processar com a LLM", "url": url})
+
+    return jsonify(resultados)
+
 
 @app.route('/')
 def hello():
     return 'Hello Comments World!'
 
-def scrape_comments_from_page(url, keyword, search):
-    try:
-        response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
-        response.raise_for_status()
-    except Exception as e:
-        return {"error": f"Erro ao acessar a página: {str(e)}"}
 
-    soup = BeautifulSoup(response.text, 'html.parser')
-    comments = []
-
-    for el in soup.find_all('p'):
-        text = el.get_text(strip=True)
-        if text and len(text) > 20:
-            comments.append({
-                "keyword": keyword,
-                "body": text,
-                "author": "Desconhecido",
-                "createDate": datetime.utcnow().isoformat(),
-                "sentiment": None,
-                "search": search
-            })
-
-    return comments
-
-def crawl_comments_from_url(start_url, keyword, search, max_pages=5):
-    visited = set()
-    queue = deque([start_url])
-    comments = []
-
-    headers = {'User-Agent': 'Mozilla/5.0'}
-
-    while queue and len(visited) < max_pages:
-        current_url = queue.popleft()
-        if current_url in visited:
-            continue
-
-        try:
-            response = requests.get(current_url, headers=headers, timeout=10)
-            response.raise_for_status()
-        except Exception as e:
-            print(f"Erro ao acessar {current_url}: {e}")
-            continue
-
-        visited.add(current_url)
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        for p in soup.find_all('p'):
-            text = p.get_text(strip=True)
-            if text and len(text) > 20:
-                comments.append({
-                    "keyword": keyword,
-                    "body": text,
-                    "author": "Desconhecido",
-                    "createDate": datetime.utcnow().isoformat(),
-                    "sentiment": None,
-                    "search": search
-                })
-
-        base_url = '{uri.scheme}://{uri.netloc}'.format(uri=urlparse(start_url))
-        for link_tag in soup.find_all('a', href=True):
-            href = link_tag['href']
-            full_url = urljoin(current_url, href)
-            if urlparse(full_url).netloc == urlparse(start_url).netloc:
-                if full_url not in visited and full_url.startswith(base_url):
-                    queue.append(full_url)
-
-    return comments
-
-@app.route('/comments/scraping', methods=['POST'])
-def scraping_comments():
-    data = request.get_json()
-    urls = data.get('urls')
-    keyword = data.get('keyword')
-    search = data.get('search')
-
-    if not urls or not isinstance(urls, list) or not keyword:
-        return jsonify({"error": "urls (lista) e keyword são obrigatórios"}), 400
-
-    all_comments = []
-
-    for url in urls:
-        comments = scrape_comments_from_page(url, keyword, search)
-        if isinstance(comments, dict) and "error" in comments:
-            continue
-        all_comments.extend(comments)
-
-    return jsonify({
-        "status": "success",
-        "message": f"{len(all_comments)} comentários coletados com scraping",
-        "comments": all_comments
-    })
-
-@app.route('/comments/crawling', methods=['POST'])
-def crawling_comments():
-    data = request.get_json()
-    urls = data.get('urls')
-    keyword = data.get('keyword')
-    search = data.get('search')
-
-    if not urls or not isinstance(urls, list) or not keyword:
-        return jsonify({"error": "urls (lista) e keyword são obrigatórios"}), 400
-
-    all_comments = []
-
-    for url in urls:
-        comments = crawl_comments_from_url(url, keyword, search)
-        all_comments.extend(comments)
-
-    return jsonify({
-        "status": "success",
-        "message": f"{len(all_comments)} comentários coletados com crawling",
-        "comments": all_comments
-    })
-
-# Permite rodar localmente com `python index.py`
-# if __name__ == "__main__":
-#     port = int(os.environ.get("PORT", 5000))
-#     app.run(host="0.0.0.0", port=port)
+if __name__ == '__main__':
+    app.run(debug=True)
