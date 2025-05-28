@@ -71,48 +71,6 @@ def send_comments_to_llm(html_snippet, keyword):
         "Content-Type": "application/json",
     }
 
-    html_snippet = """
-    <!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-    <meta charset="UTF-8">
-    <title>Comentário de Exemplo</title>
-    <style>
-        .ui-reviewcomment {
-            border: 1px solid #ccc;
-            padding: 10px;
-            margin: 10px;
-            font-family: Arial, sans-serif;
-            background-color: #f9f9f9;
-        }
-        .ui-reviewauthor {
-            font-weight: bold;
-            margin-bottom: 5px;
-        }
-        .ui-reviewdate {
-            font-size: 0.9em;
-            color: #666;
-            margin-bottom: 5px;
-        }
-        .ui-reviewcontent {
-            font-size: 1em;
-        }
-    </style>
-</head>
-<body>
-
-<div class="ui-reviewcomment">
-    <div class="ui-reviewauthor">João Silva</div>
-    <div class="ui-reviewdate">27 de Maio de 2025</div>
-    <div class="ui-reviewcontent">
-        Ótimo produto! Chegou rápido e a qualidade superou minhas expectativas.
-    </div>
-</div>
-
-</body>
-</html>
-    """
-
     prompt = f"""
 Você receberá blocos HTML contendo comentários de usuários.
 Extraia os dados abaixo para cada comentário encontrado:
