@@ -1,24 +1,36 @@
 # index.py
-# API para extrair comentários: adapters por domínio + perfis com Selenium + extrator genérico (JSON-LD, heurística) + LLM fallback
+# API para extrair comentários com adapters, perfis Selenium, extrator genérico (JSON-LD/heurística) e LLM fallback
+# Agora com modo debug: logs detalhados + dump de HTML por etapa
 
 from dotenv import load_dotenv
-load_dotenv()  # carrega variáveis do .env
+load_dotenv()
 
-import os, re, time, json, hashlib, logging
+import os, re, time, json, hashlib, logging, pathlib
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from bs4 import BeautifulSoup
 
-# -------- Config Flask / Logs --------
+# -------- Config Debug / Logs --------
 app = Flask(__name__)
 CORS(app, resources={r"*": {"origins": "*"}})
-logging.basicConfig(level=logging.INFO)
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = app.logger
+
+# snapshots de html
+DEBUG_HTML_DIR = pathlib.Path(os.getenv("DEBUG_HTML_DIR", "./_debug_html")).resolve()
+DEBUG_HTML_DIR.mkdir(parents=True, exist_ok=True)
+
+# controles (podem ser sobrescritos no body do POST)
+DUMP_HTML_DEFAULT = os.getenv("DUMP_HTML", "0") == "1"       # salva snapshots de HTML?
+DUMP_MAX_MB = int(os.getenv("DUMP_MAX_MB", "5"))             # limite por arquivo
+LOG_PROMPTS = os.getenv("LOG_PROMPTS", "0") == "1"           # loga trechos do prompt do LLM?
 
 # -------- Config LLM (Groq) --------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -36,12 +48,12 @@ BASE_HEADERS = {
 
 # -------- Limites / Orçamento LLM --------
 MIN_BODY_LEN = 20
-USE_SELENIUM_DEFAULT = False   # usar Selenium só quando pedir (ou quando perfil exigir)
-MAX_CANDIDATES_PER_URL = 20    # quantos blocos mandamos ao LLM
-MAX_INPUT_CHARS = 8000         # corte do texto do chunk
-MAX_OUTPUT_TOKENS = 256        # resposta curta (JSON)
-TOKENS_PER_MIN_BUDGET = 9000   # orçamento por minuto (ajuste conforme sua cota)
-MAX_COMMENTS_PER_URL = 200     # evita explodir resposta
+USE_SELENIUM_DEFAULT = False
+MAX_CANDIDATES_PER_URL = 20
+MAX_INPUT_CHARS = 8000
+MAX_OUTPUT_TOKENS = 256
+TOKENS_PER_MIN_BUDGET = 9000
+MAX_COMMENTS_PER_URL = 200
 
 # -------- Selenium opcional --------
 try:
@@ -53,7 +65,7 @@ try:
 except Exception:
     webdriver = None
 
-# ==================== Utils ====================
+# ==================== Utils / Debug ====================
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -68,30 +80,53 @@ def get_domain(url: str) -> str:
     return urlparse(url).netloc.lower()
 
 def estimate_tokens(s: str) -> int:
-    # Aproximação: ~4 chars por token
-    return max(1, len(s) // 4)
+    return max(1, len(s) // 4)  # ~4 chars/token
 
 class TokenBudget:
     def __init__(self, per_min: int):
         self.per_min = per_min
         self.window_start = time.time()
         self.used = 0
-
     def maybe_wait(self, tokens_needed: int):
         now = time.time()
-        # janela móvel de 60s
         if now - self.window_start >= 60:
             self.window_start = now
             self.used = 0
         if self.used + tokens_needed > self.per_min:
             sleep_for = 60 - (now - self.window_start)
             if sleep_for > 0:
+                logger.warning(f"[budget] aguardando {sleep_for:.1f}s (tpm)")
                 time.sleep(sleep_for)
             self.window_start = time.time()
             self.used = 0
         self.used += tokens_needed
 
 token_budget = TokenBudget(TOKENS_PER_MIN_BUDGET)
+
+def safe_write(path: pathlib.Path, data: bytes):
+    try:
+        if len(data) > DUMP_MAX_MB * 1024 * 1024:
+            data = data[: DUMP_MAX_MB * 1024 * 1024]
+        path.write_bytes(data)
+    except Exception as e:
+        logger.warning(f"[debug] falha ao salvar {path.name}: {e}")
+
+def dump_html(url: str, stage: str, html: str) -> Optional[str]:
+    """Salva um snapshot do HTML e retorna o nome do arquivo (para GET /debug/html/<file>)."""
+    try:
+        uhash = sha1(url)
+        name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{stage}_{uhash}.html"
+        p = DEBUG_HTML_DIR / name
+        safe_write(p, html.encode("utf-8", errors="ignore"))
+        logger.info(f"[dump] {stage} -> {name} ({len(html)} bytes)")
+        return name
+    except Exception as e:
+        logger.warning(f"[dump] erro: {e}")
+        return None
+
+def snippet(s: str, n: int = 400) -> str:
+    s = s.replace("\n", " ")
+    return (s[:n] + "…") if len(s) > n else s
 
 # ==================== Perfis por site: configuração ====================
 
@@ -102,7 +137,6 @@ HARD_DOMAINS_SELENIUM = {
 }
 
 SITE_PROFILES = {
-    # YouTube: comentários em ytd-comment-renderer, texto em #content-text
     "youtube.com": {
         "click_more": [
             "tp-yt-paper-button#more-replies",
@@ -115,8 +149,6 @@ SITE_PROFILES = {
         "author": ["#author-text span", "#author-text"],
         "scroll_steps": 30
     },
-
-    # Mercado Livre (estrutura variável)
     "mercadolivre.com.br": {
         "click_more": [
             "button.andes-button--quiet",
@@ -137,40 +169,38 @@ SITE_PROFILES = {
         ],
         "scroll_steps": 20
     },
-
-    # Reclame AQUI
     "reclameaqui.com.br": {
-        "click_more": [
-            ".see-more, .load-more, button[aria-label*='mais']"
-        ],
-        "comment_blocks": [
-            ".complain-status-comments .comment, .comment__body, .complaint-card__comment"
-        ],
-        "comment_text": [
-            ".comment__body, .complaint-card__comment__content, .comment__text"
-        ],
-        "author": [
-            ".comment__author, .complaint-card__comment__author, .author"
-        ],
+        "click_more": [".see-more, .load-more, button[aria-label*='mais']"],
+        "comment_blocks": [".complain-status-comments .comment, .comment__body, .complaint-card__comment"],
+        "comment_text": [".comment__body, .complaint-card__comment__content, .comment__text"],
+        "author": [".comment__author, .complaint-card__comment__author, .author"],
         "scroll_steps": 25
     }
 }
 
 # ==================== Fetchers ====================
 
-def fetch_html_requests(url: str) -> Optional[str]:
+def fetch_html_requests(url: str, dump: bool = False, debug_paths: Optional[list] = None) -> Optional[str]:
     try:
+        logger.info(f"[requests] GET {url}")
         r = requests.get(url, headers=BASE_HEADERS, timeout=DEFAULT_TIMEOUT)
+        logger.info(f"[requests] {url} -> {r.status_code} ({len(r.text)} bytes)")
         r.raise_for_status()
-        return r.text
+        html = r.text
+        if dump:
+            name = dump_html(url, "requests", html)
+            if debug_paths is not None and name:
+                debug_paths.append(name)
+        logger.debug(f"[requests] head: {snippet(html)}")
+        return html
     except Exception as e:
         logger.warning(f"[requests] {url} -> {e}")
         return None
 
-def fetch_html_selenium(url: str) -> Optional[str]:
+def fetch_html_selenium(url: str, dump: bool = False, debug_paths: Optional[list] = None) -> Optional[str]:
     if webdriver is None:
         logger.warning("Selenium indisponível; usando requests()")
-        return fetch_html_requests(url)
+        return fetch_html_requests(url, dump=dump, debug_paths=debug_paths)
 
     options = Options()
     options.add_argument("--headless=new")
@@ -180,9 +210,11 @@ def fetch_html_selenium(url: str) -> Optional[str]:
     options.add_argument(f"user-agent={UA}")
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
     try:
+        logger.info(f"[selenium] GET {url}")
         driver.get(url)
+        time.sleep(1.0)
 
-        # Tentativa best-effort de clicar abas de review/avaliações
+        # tentativa de clicar abas comuns
         try:
             cand_xpaths = [
                 "//a[contains(translate(@href,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'review')]",
@@ -193,23 +225,32 @@ def fetch_html_selenium(url: str) -> Optional[str]:
             for xp in cand_xpaths:
                 els = driver.find_elements(By.XPATH, xp)
                 if els:
+                    logger.info(f"[selenium] click '{xp}' ({len(els)})")
                     els[0].click()
-                    time.sleep(1.2)
+                    time.sleep(1.0)
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[selenium] clicks ignorados: {e}")
 
-        # Scroll controlado
+        # scroll
         last_h = 0
-        for _ in range(10):
+        for i in range(10):
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(0.8)
             new_h = driver.execute_script("return document.body.scrollHeight")
+            logger.debug(f"[selenium] scroll {i} -> h={new_h}")
             if new_h == last_h:
                 break
             last_h = new_h
 
-        return driver.page_source
+        html = driver.page_source
+        logger.info(f"[selenium] page_source length={len(html)}")
+        if dump:
+            name = dump_html(url, "selenium", html)
+            if debug_paths is not None and name:
+                debug_paths.append(name)
+        logger.debug(f"[selenium] head: {snippet(html)}")
+        return html
     except Exception as e:
         logger.warning(f"[selenium] {url} -> {e}")
         return None
@@ -219,18 +260,14 @@ def fetch_html_selenium(url: str) -> Optional[str]:
         except Exception:
             pass
 
-def fetch_html(url: str, use_selenium: Optional[bool] = None) -> Tuple[Optional[str], bool]:
-    """
-    Retorna (html, used_selenium)
-    """
+def fetch_html(url: str, use_selenium: Optional[bool] = None, dump: bool = False, debug_paths: Optional[list] = None) -> Tuple[Optional[str], bool]:
     use_selenium = USE_SELENIUM_DEFAULT if use_selenium is None else use_selenium
     if use_selenium:
-        html = fetch_html_selenium(url)
+        html = fetch_html_selenium(url, dump=dump, debug_paths=debug_paths)
         return html, True if html is not None else False
-    html = fetch_html_requests(url)
+    html = fetch_html_requests(url, dump=dump, debug_paths=debug_paths)
     if html is None:
-        # fallback Selenium
-        html = fetch_html_selenium(url)
+        html = fetch_html_selenium(url, dump=dump, debug_paths=debug_paths)
         return html, True if html is not None else False
     return html, False
 
@@ -244,57 +281,57 @@ def selenium_click_all(driver, css_selectors: List[str], max_clicks: int = 30, s
                 els = driver.find_elements(By.CSS_SELECTOR, sel)
                 if not els:
                     break
-                for el in els[:3]:  # segurança para não clicar infinitamente
+                for el in els[:3]:
                     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
                     time.sleep(0.2)
                     el.click()
                     time.sleep(sleep_s)
                     clicks += 1
+                    logger.debug(f"[selenium] clicked '{sel}' (total={clicks})")
                     if clicks >= max_clicks:
                         break
-            except Exception:
+            except Exception as e:
+                logger.debug(f"[selenium] click '{sel}' erro: {e}")
                 break
 
 def selenium_smart_scroll(driver, steps: int = 20, sleep_s: float = 0.8):
     last_h = 0
-    for _ in range(steps):
+    for i in range(steps):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(sleep_s)
         new_h = driver.execute_script("return document.body.scrollHeight")
+        logger.debug(f"[selenium] smart_scroll {i} -> h={new_h}")
         if new_h == last_h:
             break
         last_h = new_h
 
-def extract_with_site_profile(url: str, keyword: str, search: Optional[str], use_selenium: bool) -> Tuple[List[Dict[str, Any]], bool]:
-    """
-    Retorna (items, used_selenium)
-    """
+def extract_with_site_profile(url: str, keyword: str, search: Optional[str], use_selenium: bool,
+                              dump: bool = False, debug_paths: Optional[list] = None) -> Tuple[List[Dict[str, Any]], bool]:
     domain = get_domain(url)
     prof_key = next((k for k in SITE_PROFILES.keys() if k in domain), None)
     if not prof_key:
         return [], False
 
     profile = SITE_PROFILES[prof_key]
-
-    # Se não pediu selenium explicitamente, forçamos para domínios “duros”
     must_use_selenium = use_selenium or (domain in HARD_DOMAINS_SELENIUM)
+    logger.info(f"[profile:{prof_key}] must_use_selenium={must_use_selenium}")
+
     if webdriver is None and must_use_selenium:
-        logger.info(f"[profile:{prof_key}] Selenium indisponível; caindo para requests().")
-        html = fetch_html_requests(url)
+        logger.info(f"[profile:{prof_key}] Selenium indisponível; fallback requests")
+        html = fetch_html_requests(url, dump=dump, debug_paths=debug_paths)
         if not html:
             return [], False
-        # tenta JSON-LD com HTML estático (melhor que nada)
         return extract_reviews_from_jsonld(html, keyword, search), False
 
     if not must_use_selenium:
-        # tentar com requests puro (quase sempre insuficiente p/ sites JS pesados)
-        html = fetch_html_requests(url)
+        html = fetch_html_requests(url, dump=dump, debug_paths=debug_paths)
         if html:
-            # tenta detectar algo com seletores básicos
             soup = BeautifulSoup(html, "html.parser")
             out = []
             for sel in profile.get("comment_text", []):
-                for el in soup.select(sel):
+                found = soup.select(sel)
+                logger.info(f"[profile:{prof_key}] CSS '{sel}' -> {len(found)} nós")
+                for el in found:
                     body = clean_text(el.get_text(" ", strip=True))
                     if len(body) >= MIN_BODY_LEN:
                         out.append({
@@ -306,16 +343,16 @@ def extract_with_site_profile(url: str, keyword: str, search: Optional[str], use
                             "search": search
                         })
             if out:
-                # dedup
                 uniq, seen = [], set()
                 for it in out:
                     h = sha1(it["body"])
                     if h not in seen:
                         seen.add(h)
                         uniq.append(it)
+                logger.info(f"[profile:{prof_key}] extraídos={len(uniq)} (requests)")
                 return uniq, False
 
-    # Selenium path
+    # Selenium
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--disable-gpu")
@@ -326,16 +363,12 @@ def extract_with_site_profile(url: str, keyword: str, search: Optional[str], use
 
     out: List[Dict[str, Any]] = []
     try:
+        logger.info(f"[profile:{prof_key}] selenium GET {url}")
         driver.get(url)
         time.sleep(2.0)
 
-        # primeiro scroll para montar DOM
         selenium_smart_scroll(driver, steps=profile.get("scroll_steps", 20))
-
-        # tenta clicar “ver mais / ver respostas”
         selenium_click_all(driver, profile.get("click_more", []), max_clicks=40, sleep_s=0.9)
-
-        # mais scroll após expandir
         selenium_smart_scroll(driver, steps=profile.get("scroll_steps", 20))
 
         blocks_sel = profile.get("comment_blocks", [])
@@ -344,7 +377,9 @@ def extract_with_site_profile(url: str, keyword: str, search: Optional[str], use
 
         blocks = []
         for blk in blocks_sel:
-            blocks.extend(driver.find_elements(By.CSS_SELECTOR, blk))
+            found = driver.find_elements(By.CSS_SELECTOR, blk)
+            logger.info(f"[profile:{prof_key}] blocks '{blk}' -> {len(found)}")
+            blocks.extend(found)
 
         def first_text(el, selectors):
             for sel in selectors:
@@ -357,30 +392,39 @@ def extract_with_site_profile(url: str, keyword: str, search: Optional[str], use
                     continue
             return ""
 
-        for b in blocks:
+        for i, b in enumerate(blocks):
             body = first_text(b, text_sel)
             if len(body) >= MIN_BODY_LEN:
                 author = first_text(b, author_sel) or "Desconhecido"
                 out.append({
-                    "keyword": keyword,
-                    "body": body,
-                    "author": author,
-                    "createDate": now_iso(),
-                    "sentiment": None,
-                    "search": search
+                    "keyword": keyword, "body": body, "author": author,
+                    "createDate": now_iso(), "sentiment": None, "search": search
                 })
+            if i < 3 and dump:  # salva amostra do bloco renderizado (texto) em arquivo txt
+                try:
+                    sample = f"[BLOCK {i} BODY]\n{body}\n"
+                    fname = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_profileblk_{sha1(url)}_{i}.txt"
+                    safe_write((DEBUG_HTML_DIR / fname), sample.encode("utf-8"))
+                except Exception:
+                    pass
 
-        # dedup
+        html = driver.page_source
+        if dump:
+            name = dump_html(url, f"profile_{prof_key}", html)
+            if debug_paths is not None and name:
+                debug_paths.append(name)
+
         uniq, seen = [], set()
         for it in out:
             h = sha1(it["body"])
             if h not in seen:
                 seen.add(h)
                 uniq.append(it)
+        logger.info(f"[profile:{prof_key}] extraídos={len(uniq)} (selenium)")
         return uniq, True
     except Exception as e:
         logger.warning(f"[profile:{prof_key}] erro: {e}")
-        return [], True  # tentou selenium
+        return [], True
     finally:
         try:
             driver.quit()
@@ -389,17 +433,19 @@ def extract_with_site_profile(url: str, keyword: str, search: Optional[str], use
 
 # ==================== Extratores sem LLM ====================
 
-# 1) JSON-LD Reviews genérico
 def extract_reviews_from_jsonld(html: str, keyword: str, search: Optional[str]) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
     out: List[Dict[str, Any]] = []
 
     def ensure_list(x):
-        if x is None:
-            return []
+        if x is None: return []
         return x if isinstance(x, list) else [x]
 
+    total_scripts = 0
+    total_reviews = 0
+
     for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        total_scripts += 1
         try:
             data = json.loads(script.string or "")
         except Exception:
@@ -407,65 +453,50 @@ def extract_reviews_from_jsonld(html: str, keyword: str, search: Optional[str]) 
 
         nodes = ensure_list(data)
         for node in nodes:
-            # Alguns sites colocam um "Product" com campo "review" (array ou objeto)
             if isinstance(node, dict) and node.get("@type") in ["Product", "CreativeWork", "Service", "Thing"]:
                 reviews = ensure_list(node.get("review"))
+                logger.debug(f"[jsonld] @type={node.get('@type')} reviews={len(reviews)}")
                 for rv in reviews:
-                    if not isinstance(rv, dict):
-                        continue
-                    if rv.get("@type") != "Review":
-                        continue
+                    if not isinstance(rv, dict) or rv.get("@type") != "Review": continue
                     body = clean_text(rv.get("reviewBody") or rv.get("description") or "")
                     author = rv.get("author")
-                    if isinstance(author, dict):
-                        author = author.get("name")
+                    if isinstance(author, dict): author = author.get("name")
                     author = clean_text(author or "Desconhecido")
                     if len(body) >= MIN_BODY_LEN:
+                        total_reviews += 1
                         out.append({
-                            "keyword": keyword,
-                            "body": body,
-                            "author": author or "Desconhecido",
-                            "createDate": now_iso(),
-                            "sentiment": None,
-                            "search": search
+                            "keyword": keyword, "body": body, "author": author or "Desconhecido",
+                            "createDate": now_iso(), "sentiment": None, "search": search
                         })
-            # Ou o script é diretamente um Review/array de Review
+
             if isinstance(node, dict) and node.get("@type") == "Review":
                 body = clean_text(node.get("reviewBody") or node.get("description") or "")
                 author = node.get("author")
-                if isinstance(author, dict):
-                    author = author.get("name")
+                if isinstance(author, dict): author = author.get("name")
                 author = clean_text(author or "Desconhecido")
                 if len(body) >= MIN_BODY_LEN:
+                    total_reviews += 1
                     out.append({
-                        "keyword": keyword,
-                        "body": body,
-                        "author": author or "Desconhecido",
-                        "createDate": now_iso(),
-                        "sentiment": None,
-                        "search": search
+                        "keyword": keyword, "body": body, "author": author or "Desconhecido",
+                        "createDate": now_iso(), "sentiment": None, "search": search
                     })
+
             if isinstance(node, list):
                 for rv in node:
-                    if not isinstance(rv, dict):
-                        continue
-                    if rv.get("@type") != "Review":
-                        continue
+                    if not isinstance(rv, dict) or rv.get("@type") != "Review": continue
                     body = clean_text(rv.get("reviewBody") or rv.get("description") or "")
                     author = rv.get("author")
-                    if isinstance(author, dict):
-                        author = author.get("name")
+                    if isinstance(author, dict): author = author.get("name")
                     author = clean_text(author or "Desconhecido")
                     if len(body) >= MIN_BODY_LEN:
+                        total_reviews += 1
                         out.append({
-                            "keyword": keyword,
-                            "body": body,
-                            "author": author or "Desconhecido",
-                            "createDate": now_iso(),
-                            "sentiment": None,
-                            "search": search
+                            "keyword": keyword, "body": body, "author": author or "Desconhecido",
+                            "createDate": now_iso(), "sentiment": None, "search": search
                         })
-    # dedup por corpo
+
+    logger.info(f"[jsonld] scripts={total_scripts} reviews_extraidos={total_reviews}")
+    # dedup
     uniq, seen = [], set()
     for it in out:
         h = sha1(it["body"])
@@ -474,7 +505,6 @@ def extract_reviews_from_jsonld(html: str, keyword: str, search: Optional[str]) 
             uniq.append(it)
     return uniq
 
-# 2) Heurística HTML (ampliada)
 COMMON_COMMENT_CLASSES = [
     "review", "comment", "opinion", "feedback",
     "ugc", "rating", "testimonial", "reply", "replies",
@@ -485,32 +515,26 @@ def extract_comment_candidates(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
     blocks = []
 
-    # schema.org Review/Comment
     for tag in soup.find_all(attrs={"itemtype": re.compile("schema.org/(Review|Comment)", re.I)}):
         blocks.append(str(tag))
 
-    # itemprop comuns
     for tag in soup.find_all(attrs={"itemprop": re.compile("(reviewBody|comment|description)", re.I)}):
         blocks.append(str(tag))
 
-    # data-* comuns
     for tag in soup.find_all(attrs={"data-testid": re.compile("(review|comment)", re.I)}):
         blocks.append(str(tag))
     for tag in soup.find_all(attrs={"data-test": re.compile("(review|comment)", re.I)}):
         blocks.append(str(tag))
 
-    # classes comuns
     for cls in COMMON_COMMENT_CLASSES:
         for tag in soup.find_all(class_=re.compile(cls, re.I)):
             blocks.append(str(tag))
 
-    # tags gerais com classes de review
     for tag in soup.select("article, li, div, section"):
         classes = " ".join(tag.get("class", []))
         if re.search(r"(review|comment|opinion|rating|feedback|reply)", classes or "", re.I):
             blocks.append(str(tag))
 
-    # fallback: parágrafos longos
     long_ps = [p for p in soup.find_all("p") if len(p.get_text(strip=True)) >= MIN_BODY_LEN]
     if long_ps:
         container = BeautifulSoup("<div></div>", "html.parser").div
@@ -518,7 +542,6 @@ def extract_comment_candidates(html: str) -> List[str]:
             container.append(p)
         blocks.append(str(container))
 
-    # dedup
     seen, unique = set(), []
     for b in blocks:
         text = BeautifulSoup(b, "html.parser").get_text(" ", strip=True)
@@ -527,6 +550,7 @@ def extract_comment_candidates(html: str) -> List[str]:
             seen.add(h)
             unique.append(b)
 
+    logger.info(f"[heuristic] candidatos={len(unique)} (antes do corte)")
     return unique[:MAX_CANDIDATES_PER_URL]
 
 # ==================== LLM helpers ====================
@@ -572,8 +596,7 @@ TEXTO:
 
 def call_groq(prompt: str, max_retries: int = 3) -> List[Dict[str, Any]]:
     if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY não definida (coloque no .env ou var de ambiente).")
-
+        raise RuntimeError("GROQ_API_KEY não definida.")
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": GROQ_MODEL,
@@ -581,10 +604,12 @@ def call_groq(prompt: str, max_retries: int = 3) -> List[Dict[str, Any]]:
         "temperature": 0.2,
         "max_tokens": MAX_OUTPUT_TOKENS,
     }
-
-    # orçamento simples: entrada + folga de saída
+    # orçamento simples
     input_tokens = estimate_tokens(prompt) + MAX_OUTPUT_TOKENS
     token_budget.maybe_wait(input_tokens)
+
+    if LOG_PROMPTS:
+        logger.debug(f"[groq] prompt: {snippet(prompt, 1000)}")
 
     backoff = 1.0
     for attempt in range(max_retries + 1):
@@ -592,12 +617,12 @@ def call_groq(prompt: str, max_retries: int = 3) -> List[Dict[str, Any]]:
             resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
         except Exception as e:
             logger.warning(f"[groq] erro de rede: {e}")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 8.0)
+            time.sleep(backoff); backoff = min(backoff * 2, 8.0)
             continue
 
         if resp.status_code == 200:
             content = resp.json()["choices"][0]["message"]["content"]
+            logger.debug(f"[groq] len(content)={len(content)} sample={snippet(content)}")
             try:
                 return json.loads(content)
             except Exception:
@@ -613,13 +638,11 @@ def call_groq(prompt: str, max_retries: int = 3) -> List[Dict[str, Any]]:
             ra = resp.headers.get("Retry-After")
             sleep_for = float(ra) if ra else backoff
             logger.warning(f"[groq] 429; aguardando {sleep_for:.1f}s e tentando de novo…")
-            time.sleep(sleep_for)
-            backoff = min(backoff * 2, 10.0)
+            time.sleep(sleep_for); backoff = min(backoff * 2, 10.0)
             continue
 
         logger.warning(f"[groq] HTTP {resp.status_code}: {resp.text[:240]}")
-        time.sleep(backoff)
-        backoff = min(backoff * 2, 8.0)
+        time.sleep(backoff); backoff = min(backoff * 2, 8.0)
 
     return []
 
@@ -631,28 +654,24 @@ def normalize_items(items: List[Dict[str, Any]], keyword: str, search: Optional[
             continue
         author = clean_text(it.get("author", "")) or "Desconhecido"
         item = {
-            "keyword": keyword,
-            "body": body,
-            "author": author,
+            "keyword": keyword, "body": body, "author": author,
             "createDate": it.get("createDate") or now_iso(),
-            "sentiment": None,
-            "search": search
+            "sentiment": None, "search": search
         }
         h = sha1(body)
         if h not in seen:
             seen.add(h)
             norm.append(item)
+    logger.info(f"[normalize] itens_validos={len(norm)}")
     return norm
 
-# ==================== Adapters por domínio ====================
+# ==================== Adapters ====================
 
-# --- Reddit (.json do post) com replies recursivas ---
 def is_reddit(url: str) -> bool:
     d = get_domain(url)
     return d.endswith("reddit.com") or d.endswith("redd.it")
 
 def reddit_fetch_comments(url: str, keyword: str, search: Optional[str]) -> List[Dict[str, Any]]:
-    # Garante a URL .json
     if not url.endswith(".json"):
         if "/comments/" in url:
             api_url = url.split("?")[0].rstrip("/") + ".json"
@@ -660,41 +679,35 @@ def reddit_fetch_comments(url: str, keyword: str, search: Optional[str]) -> List
             api_url = url.rstrip("/") + ".json"
     else:
         api_url = url
-
     try:
+        logger.info(f"[reddit] GET {api_url}")
         r = requests.get(api_url, headers={"User-Agent": UA}, timeout=DEFAULT_TIMEOUT)
+        logger.info(f"[reddit] {api_url} -> {r.status_code}")
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        logger.warning(f"[reddit] falha em {api_url}: {e}")
+        logger.warning(f"[reddit] falha: {e}")
         return []
 
     out: List[Dict[str, Any]] = []
 
     def walk(node):
-        if not isinstance(node, dict):
-            return
+        if not isinstance(node, dict): return
         kind = node.get("kind")
         data_ = node.get("data", {}) if isinstance(node.get("data"), dict) else {}
-        if kind == "t1":  # comment
+        if kind == "t1":
             body = clean_text(data_.get("body", ""))
             author = data_.get("author") or "Desconhecido"
             if len(body) >= MIN_BODY_LEN:
                 out.append({
-                    "keyword": keyword,
-                    "body": body,
-                    "author": author,
-                    "createDate": now_iso(),
-                    "sentiment": None,
-                    "search": search
+                    "keyword": keyword, "body": body, "author": author,
+                    "createDate": now_iso(), "sentiment": None, "search": search
                 })
-            # replies pode ser string "" OU objeto
             replies = data_.get("replies")
             if isinstance(replies, dict):
                 for child in replies.get("data", {}).get("children", []):
                     walk(child)
         elif kind in ("Listing", None):
-            # children
             for child in (node.get("data", {}) or {}).get("children", []):
                 walk(child)
 
@@ -707,16 +720,15 @@ def reddit_fetch_comments(url: str, keyword: str, search: Optional[str]) -> List
     except Exception as e:
         logger.warning(f"[reddit] parse recursivo falhou: {e}")
 
-    # dedup por corpo
     uniq, seen = [], set()
     for it in out:
         h = sha1(it["body"])
         if h not in seen:
             seen.add(h)
             uniq.append(it)
+    logger.info(f"[reddit] extraídos={len(uniq)}")
     return uniq
 
-# --- Shopee (API de ratings do front) ---
 def is_shopee(url: str) -> bool:
     return "shopee." in get_domain(url)
 
@@ -724,8 +736,7 @@ _SHOPEE_ID_RE = re.compile(r"/i\.(\d+)\.(\d+)", re.I)
 
 def parse_shopee_ids(url: str) -> Optional[Dict[str, int]]:
     m = _SHOPEE_ID_RE.search(url)
-    if not m:
-        return None
+    if not m: return None
     try:
         return {"shopid": int(m.group(1)), "itemid": int(m.group(2))}
     except Exception:
@@ -733,30 +744,22 @@ def parse_shopee_ids(url: str) -> Optional[Dict[str, int]]:
 
 def shopee_fetch_reviews(url: str, keyword: str, search: Optional[str], limit: int = 50, pages: int = 2) -> List[Dict[str, Any]]:
     ids = parse_shopee_ids(url)
-    if not ids:
-        return []
+    if not ids: return []
     base = f"https://{get_domain(url)}"
     out: List[Dict[str, Any]] = []
 
     for p in range(pages):
         offset = p * limit
         params = {
-            "itemid": ids["itemid"],
-            "shopid": ids["shopid"],
-            "limit": str(limit),
-            "offset": str(offset),
-            "type": "0",
-            "filter": "0",
-            "flag": "1",
-            "sort": "0"
+            "itemid": ids["itemid"], "shopid": ids["shopid"],
+            "limit": str(limit), "offset": str(offset),
+            "type": "0", "filter": "0", "flag": "1", "sort": "0"
         }
         try:
-            resp = requests.get(
-                base + "/api/v2/item/get_ratings",
-                params=params,
-                headers={**BASE_HEADERS, "Referer": url},
-                timeout=DEFAULT_TIMEOUT
-            )
+            logger.info(f"[shopee] GET ratings offset={offset}")
+            resp = requests.get(base + "/api/v2/item/get_ratings", params=params,
+                                headers={**BASE_HEADERS, "Referer": url}, timeout=DEFAULT_TIMEOUT)
+            logger.info(f"[shopee] -> {resp.status_code}")
             if resp.status_code != 200:
                 logger.warning(f"[shopee] HTTP {resp.status_code}: {resp.text[:200]}")
                 break
@@ -766,58 +769,51 @@ def shopee_fetch_reviews(url: str, keyword: str, search: Optional[str], limit: i
             break
 
         ratings = (data or {}).get("data", {}).get("ratings") or []
+        logger.info(f"[shopee] ratings={len(ratings)}")
         for r in ratings:
             body = clean_text((r.get("comment") or "") + " " + (r.get("comment_reply") or ""))
             author = clean_text((r.get("author_username") or r.get("author_shopid") or "")) or "Desconhecido"
             if len(body) >= MIN_BODY_LEN:
                 out.append({
-                    "keyword": keyword,
-                    "body": body,
-                    "author": author,
-                    "createDate": now_iso(),
-                    "sentiment": None,
-                    "search": search
+                    "keyword": keyword, "body": body, "author": author,
+                    "createDate": now_iso(), "sentiment": None, "search": search
                 })
+        if not ratings: break
 
-        if not ratings:
-            break
-
-    # dedup
     uniq, seen = [], set()
     for it in out:
         h = sha1(it["body"])
         if h not in seen:
             seen.add(h)
             uniq.append(it)
+    logger.info(f"[shopee] extraídos={len(uniq)}")
     return uniq
 
 # ==================== Pipeline genérico via LLM ====================
 
 def generic_extract_via_llm(url: str, keyword: str, search: Optional[str], use_selenium: bool,
-                            max_candidates: int, max_comments: int) -> Tuple[List[Dict[str, Any]], bool, str]:
-    """
-    Retorna (items, used_selenium, source)
-      - source: 'jsonld' | 'llm' | 'heuristic' | 'none'
-    """
-    html, used_sel = fetch_html(url, use_selenium)
+                            max_candidates: int, max_comments: int,
+                            dump: bool = False, debug_paths: Optional[list] = None) -> Tuple[List[Dict[str, Any]], bool, str]:
+    html, used_sel = fetch_html(url, use_selenium, dump=dump, debug_paths=debug_paths)
     if not html:
         return [], used_sel, "none"
 
-    # 1) Tentar JSON-LD antes do LLM (barato e robusto)
     jld = extract_reviews_from_jsonld(html, keyword, search)
     if jld:
+        logger.info(f"[generic] JSON-LD extraiu {len(jld)}")
         return jld[:max_comments], used_sel, "jsonld"
 
-    # 2) Heurística HTML -> LLM
     candidates = extract_comment_candidates(html)
     if not candidates:
+        logger.info("[generic] 0 candidatos da heurística")
         return [], used_sel, "none"
 
     candidates = candidates[:max_candidates]
+    logger.info(f"[generic] candidatos_enviados_llm={len(candidates)} (máx={max_candidates})")
     out_for_url: List[Dict[str, Any]] = []
-
     used_llm = False
-    for chunk in candidates:
+
+    for i, chunk in enumerate(candidates):
         prompt = build_prompt(keyword, chunk)
         items: List[Dict[str, Any]] = []
         try:
@@ -826,13 +822,16 @@ def generic_extract_via_llm(url: str, keyword: str, search: Optional[str], use_s
         except Exception as e:
             logger.error(f"[groq] falha: {e}")
         if items:
+            logger.debug(f"[generic] LLM retornou {len(items)} itens para chunk {i}")
             out_for_url.extend(normalize_items(items, keyword, search))
-
         if len(out_for_url) >= max_comments:
+            logger.info("[generic] atingiu maxCommentsPerUrl")
             break
 
     if out_for_url:
-        return out_for_url[:max_comments], used_sel, ("llm" if used_llm else "heuristic")
+        src = "llm" if used_llm else "heuristic"
+        logger.info(f"[generic] extraídos={len(out_for_url)} source={src}")
+        return out_for_url[:max_comments], used_sel, src
     return [], used_sel, "none"
 
 # ==================== Endpoints ====================
@@ -845,17 +844,25 @@ def root():
 def health():
     return jsonify({"ok": True, "time": now_iso()})
 
+@app.route("/debug/html/<path:fname>", methods=["GET"])
+def debug_get_html(fname: str):
+    """Abra no navegador: http://127.0.0.1:5000/debug/html/<nome-do-arquivo>"""
+    return send_from_directory(DEBUG_HTML_DIR, fname, mimetype="text/html")
+
 @app.route("/comments/extract", methods=["POST"])
 def comments_extract():
+    global LOG_PROMPTS  # <<< declare aqui, antes de qualquer uso
+
     """
     Body JSON:
     {
       "urls": ["https://...","https://..."],
       "keyword": "nome-produto-ou-empresa",
       "search": "termo-de-busca-opcional",
-      "useSelenium": false,           // opcional (default False, mas perfis podem forçar)
-      "maxCandidates": 20,            // opcional (limite de blocos por URL)
-      "maxCommentsPerUrl": 200        // opcional (teto de comentários por URL)
+      "useSelenium": false,
+      "maxCandidates": 20,
+      "maxCommentsPerUrl": 200,
+      "debug": { "dumpHtml": true, "logPrompts": false }
     }
     """
     data = request.get_json(force=True, silent=True) or {}
@@ -866,92 +873,110 @@ def comments_extract():
     max_candidates = int(data.get("maxCandidates", MAX_CANDIDATES_PER_URL))
     max_comments = int(data.get("maxCommentsPerUrl", MAX_COMMENTS_PER_URL))
 
+    debug_cfg = data.get("debug") or {}
+    dump_html_flag = bool(debug_cfg.get("dumpHtml", DUMP_HTML_DEFAULT))
+    log_prompts_flag = bool(debug_cfg.get("logPrompts", LOG_PROMPTS))
+
+    # permite ligar LOG_PROMPTS por request
+    old_log_prompts = LOG_PROMPTS
+    LOG_PROMPTS = log_prompts_flag
+
     if not urls or not isinstance(urls, list) or not keyword:
         return jsonify({"error": "Parâmetros inválidos: 'urls' (lista) e 'keyword' são obrigatórios."}), 400
+
+    logger.info(f"[extract] urls={len(urls)} keyword='{keyword}' useSelenium={use_selenium} dumpHtml={dump_html_flag}")
 
     all_out: List[Dict[str, Any]] = []
     per_url_stats: List[Dict[str, Any]] = []
 
-    for url in urls:
-        start_t = time.time()
-        domain = get_domain(url)
-        extracted: List[Dict[str, Any]] = []
-        source = "none"
-        used_selenium_flag = False
-        used_llm_flag = False
+    try:
+        for url in urls:
+            start_t = time.time()
+            domain = get_domain(url)
+            extracted: List[Dict[str, Any]] = []
+            source = "none"
+            used_selenium_flag = False
+            used_llm_flag = False
+            debug_paths: List[str] = []
 
-        # 0) Perfil por site (YouTube, Mercado Livre, Reclame AQUI…)
-        prof_out, prof_used_sel = extract_with_site_profile(url, keyword, search, use_selenium)
-        if prof_out:
-            extracted = prof_out
-            source = "profile"
-            used_selenium_flag = prof_used_sel
+            # 0) Perfil por site
+            prof_out, prof_used_sel = extract_with_site_profile(
+                url, keyword, search, use_selenium, dump=dump_html_flag, debug_paths=debug_paths
+            )
+            if prof_out:
+                extracted = prof_out
+                source = "profile"
+                used_selenium_flag = prof_used_sel
 
-        # 1) Adapters (não usam LLM)
-        if not extracted and is_reddit(url):
-            extracted = reddit_fetch_comments(url, keyword, search)
-            source = "reddit"
-        elif not extracted and is_shopee(url):
-            extracted = shopee_fetch_reviews(url, keyword, search, limit=50, pages=2)
-            source = "shopee"
+            # 1) Adapters
+            if not extracted and is_reddit(url):
+                extracted = reddit_fetch_comments(url, keyword, search)
+                source = "reddit"
+            elif not extracted and is_shopee(url):
+                extracted = shopee_fetch_reviews(url, keyword, search, limit=50, pages=2)
+                source = "shopee"
 
-        # 2) Se ainda vazio, pipeline genérico (JSON-LD -> heurística -> LLM)
-        if not extracted:
-            if not GROQ_API_KEY:
-                logger.info("Sem GROQ_API_KEY; rodando APENAS extratores sem LLM.")
-                html, used_sel = fetch_html(url, use_selenium)
-                used_selenium_flag = used_selenium_flag or used_sel
-                extracted = extract_reviews_from_jsonld(html or "", keyword, search) if html else []
-                source = "jsonld" if extracted else "none"
-                if not extracted and html:
-                    # fallback final sem LLM: heurística de parágrafos
-                    soup = BeautifulSoup(html, "html.parser")
-                    ps = [clean_text(p.get_text(strip=True)) for p in soup.find_all("p")]
-                    for t in ps:
-                        if len(t) >= 120:  # bem conservador
-                            extracted.append({
-                                "keyword": keyword,
-                                "body": t,
-                                "author": "Desconhecido",
-                                "createDate": now_iso(),
-                                "sentiment": None,
-                                "search": search
-                            })
-                            if len(extracted) >= max_comments:
-                                break
-                    if extracted and source == "none":
-                        source = "heuristic"
-            else:
-                extracted, used_sel, src = generic_extract_via_llm(
-                    url, keyword, search, use_selenium, max_candidates, max_comments
-                )
-                used_selenium_flag = used_selenium_flag or used_sel
-                source = src
-                used_llm_flag = (src == "llm")
+            # 2) Genérico
+            if not extracted:
+                if not GROQ_API_KEY:
+                    logger.info("[extract] sem GROQ_API_KEY; rodando apenas JSON-LD/heurística básica")
+                    html, used_sel = fetch_html(url, use_selenium, dump=dump_html_flag, debug_paths=debug_paths)
+                    used_selenium_flag |= bool(used_sel)
+                    extracted = extract_reviews_from_jsonld(html or "", keyword, search) if html else []
+                    source = "jsonld" if extracted else "none"
+                    if not extracted and html:
+                        soup = BeautifulSoup(html, "html.parser")
+                        ps = [clean_text(p.get_text(strip=True)) for p in soup.find_all("p")]
+                        for t in ps:
+                            if len(t) >= 120:
+                                extracted.append({
+                                    "keyword": keyword, "body": t, "author": "Desconhecido",
+                                    "createDate": now_iso(), "sentiment": None, "search": search
+                                })
+                                if len(extracted) >= max_comments: break
+                        if extracted and source == "none":
+                            source = "heuristic"
+                else:
+                    extracted, used_sel, src = generic_extract_via_llm(
+                        url, keyword, search, use_selenium, max_candidates, max_comments,
+                        dump=dump_html_flag, debug_paths=debug_paths
+                    )
+                    used_selenium_flag |= bool(used_sel)
+                    source = src
+                    used_llm_flag = (src == "llm")
 
-        elapsed = round(time.time() - start_t, 2)
-        all_out.extend(extracted)
+            elapsed = round(time.time() - start_t, 2)
+            all_out.extend(extracted)
 
-        per_url_stats.append({
-            "url": url,
-            "ok": True,
-            "domain": domain,
-            "comments": len(extracted),
-            "elapsedSec": elapsed,
-            "source": source,            # 'profile' | 'reddit' | 'shopee' | 'jsonld' | 'heuristic' | 'llm' | 'none'
-            "usedSelenium": used_selenium_flag,
-            "usedLLM": used_llm_flag
+            stat = {
+                "url": url,
+                "ok": True,
+                "domain": domain,
+                "comments": len(extracted),
+                "elapsedSec": elapsed,
+                "source": source,
+                "usedSelenium": used_selenium_flag,
+                "usedLLM": used_llm_flag
+            }
+            if dump_html_flag and debug_paths:
+                from urllib.parse import quote
+                stat["debugHtml"] = [f"/debug/html/{quote(f)}" for f in debug_paths]
+            per_url_stats.append(stat)
+            logger.info(f"[extract] {domain} -> {len(extracted)} comentários | source={source} | {elapsed}s")
+
+        return jsonify({
+            "status": "success",
+            "message": f"{len(all_out)} comentários extraídos",
+            "stats": per_url_stats,
+            "comments": all_out
         })
+    finally:
+        # restaura a flag global para não “vazar” entre requests
+        LOG_PROMPTS = old_log_prompts
 
-    return jsonify({
-        "status": "success",
-        "message": f"{len(all_out)} comentários extraídos",
-        "stats": per_url_stats,
-        "comments": all_out
-    })
 
 # ==================== Run ====================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
-    logger.info(f"Starting Flask on http://127.0.0.1:{port}")
+    logger.info(f"Starting Flask on http://127.0.0.1:{port} (LOG_LEVEL={LOG_LEVEL})")
     app.run(host="0.0.0.0", port=port, debug=True)
