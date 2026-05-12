@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.env.local
+_debug_html/
+.pytest_cache/
+.vscode/
+.idea/
