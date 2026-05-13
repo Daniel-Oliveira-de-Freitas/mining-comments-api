@@ -34,6 +34,7 @@ from .fetcher import fetch_html
 from .cleaner import clean_html_for_llm
 from .jsonld_extractor import extract_from_jsonld
 from .llm_extractor import extract_via_llm
+from .trustpilot_adapter import is_trustpilot_url, extract_from_trustpilot
 
 
 # ==================== Setup Flask ====================
@@ -79,6 +80,16 @@ def extract_comments_from_url(
         "elapsedSec": 0.0,
         "comments": [],
     }
+
+    # ── 0. Adapters específicos para sites com proteção anti-bot forte ────────
+    if is_trustpilot_url(url):
+        logger.info(f"[pipeline] detectado Trustpilot, usando adapter dedicado")
+        comments = extract_from_trustpilot(url, keyword, search)
+        result["source"] = "trustpilot_api" if comments else "none"
+        result["fetcher"] = "trustpilot_api"
+        result["comments"] = comments[:max_comments]
+        result["elapsedSec"] = round(time.time() - start, 2)
+        return result
 
     # 1. Buscar HTML
     html, fetcher_used = fetch_html(url, force_js=force_js)
